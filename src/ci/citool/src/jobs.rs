@@ -31,6 +31,9 @@ pub struct Job {
     pub doc_url: Option<String>,
     /// Whether the job is executed on AWS CodeBuild.
     pub codebuild: Option<bool>,
+    /// Prerequisites must themselves have no dependencies; CI has two build stages.
+    #[serde(default)]
+    pub needs: Vec<String>,
 }
 
 impl Job {
@@ -167,6 +170,7 @@ fn validate_job_database(db: &JobDatabase) -> anyhow::Result<()> {
             free_disk,
             doc_url,
             codebuild,
+            needs,
 
             // Carve-out configs allowed to be different.
             env: _,
@@ -179,6 +183,7 @@ fn validate_job_database(db: &JobDatabase) -> anyhow::Result<()> {
             && *free_disk == auto_job.free_disk
             && *doc_url == auto_job.doc_url
             && *codebuild == auto_job.codebuild
+            && *needs == auto_job.needs
         {
             Ok(())
         } else {
@@ -244,6 +249,8 @@ struct GithubActionsJob {
     doc_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     codebuild: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    needs: Vec<String>,
 }
 
 /// Replace GitHub context variables with environment variables in job configs.
@@ -276,6 +283,39 @@ fn skip_jobs(jobs: Vec<Job>, channel: &str) -> Vec<Job> {
         .collect()
 }
 
+fn include_prerequisites(
+    mut jobs: Vec<Job>,
+    db: &JobDatabase,
+    channel: &str,
+) -> anyhow::Result<Vec<Job>> {
+    let prerequisites: HashSet<_> = jobs.iter().flat_map(|job| job.needs.iter().cloned()).collect();
+    for name in prerequisites {
+        let prerequisite = jobs
+            .iter()
+            .chain(db.auto_jobs.iter())
+            .chain(db.optional_jobs.iter())
+            .find(|job| job.name == name)
+            .cloned()
+            .with_context(|| format!("Unknown prerequisite job `{name}`"))?;
+        anyhow::ensure!(
+            prerequisite.needs.is_empty(),
+            "Prerequisite job `{name}` cannot have its own dependencies"
+        );
+        anyhow::ensure!(
+            prerequisite.only_on_channel.as_deref().is_none_or(|value| value == channel),
+            "Prerequisite job `{name}` is not available on channel `{channel}`"
+        );
+        anyhow::ensure!(
+            prerequisite.continue_on_error != Some(true),
+            "Prerequisite job `{name}` cannot have continue_on_error enabled"
+        );
+        if !jobs.iter().any(|job| job.name == name) {
+            jobs.push(prerequisite);
+        }
+    }
+    Ok(jobs)
+}
+
 /// Type of workflow that is being executed on CI
 #[derive(Debug)]
 pub enum RunType {
@@ -304,7 +344,7 @@ fn calculate_jobs(
 ) -> anyhow::Result<Vec<GithubActionsJob>> {
     let (jobs, prefix, base_env) = match run_type {
         RunType::PullRequest => (db.pr_jobs.clone(), "PR", &db.envs.pr_env),
-        RunType::TryJob { job_patterns, nolimit } => {
+        RunType::TryJob { job_patterns, nolimit: _ } => {
             let jobs = if let Some(patterns) = job_patterns {
                 let mut jobs: Vec<Job> = vec![];
                 let mut unknown_patterns = vec![];
@@ -326,13 +366,6 @@ fn calculate_jobs(
                         unknown_patterns.join(", ")
                     ));
                 }
-                if jobs.len() > MAX_TRY_JOBS_COUNT && !nolimit {
-                    return Err(anyhow::anyhow!(
-                        "It is only possible to schedule up to {MAX_TRY_JOBS_COUNT} custom jobs, received {} custom jobs expanded from {} pattern(s). Use `@bors try jobs=... nolimit` to allow running an arbitrary number of try jobs.",
-                        jobs.len(),
-                        patterns.len()
-                    ));
-                }
                 jobs
             } else {
                 db.try_jobs.clone()
@@ -342,9 +375,18 @@ fn calculate_jobs(
         RunType::AutoJob => (db.auto_jobs.clone(), "auto", &db.envs.auto_env),
         RunType::MainJob => return Ok(vec![]),
     };
-    let jobs = substitute_github_vars(jobs.clone())
+    let jobs = include_prerequisites(skip_jobs(jobs, channel), db, channel)?;
+    if let RunType::TryJob { job_patterns: Some(patterns), nolimit: false } = run_type {
+        if jobs.len() > MAX_TRY_JOBS_COUNT {
+            return Err(anyhow::anyhow!(
+                "It is only possible to schedule up to {MAX_TRY_JOBS_COUNT} custom jobs, received {} custom jobs expanded from {} pattern(s). Use `@bors try jobs=... nolimit` to allow running an arbitrary number of try jobs.",
+                jobs.len(),
+                patterns.len()
+            ));
+        }
+    }
+    let jobs = substitute_github_vars(jobs)
         .context("Failed to substitute GitHub context variables in jobs")?;
-    let jobs = skip_jobs(jobs, channel);
     let jobs = jobs
         .into_iter()
         .map(|job| {
@@ -375,6 +417,7 @@ fn calculate_jobs(
                 free_disk: job.free_disk,
                 doc_url: job.doc_url,
                 codebuild: job.codebuild,
+                needs: job.needs,
             }
         })
         .collect();
@@ -408,8 +451,20 @@ pub fn calculate_job_matrix(
     eprintln!("Output");
     eprintln!("jobs={jobs:?}");
     eprintln!("run_type={run_type}");
+
+    let prerequisite_names: HashSet<_> =
+        jobs.iter().flat_map(|job| job.needs.iter().cloned()).collect();
+    let (prerequisite_jobs, jobs): (Vec<_>, Vec<_>) =
+        jobs.into_iter().partition(|job| prerequisite_names.contains(&job.name));
+    let (dependent_jobs, jobs): (Vec<_>, Vec<_>) =
+        jobs.into_iter().partition(|job| !job.needs.is_empty());
+
     println!("jobs={}", serde_json::to_string(&jobs)?);
     println!("run_type={run_type}");
+    if !prerequisite_jobs.is_empty() {
+        println!("prerequisite_jobs={}", serde_json::to_string(&prerequisite_jobs)?);
+        println!("dependent_jobs={}", serde_json::to_string(&dependent_jobs)?);
+    }
 
     Ok(())
 }

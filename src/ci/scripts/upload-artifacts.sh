@@ -17,7 +17,8 @@ if isLinux; then
 fi
 
 # Release tarballs produced by a dist builder.
-if [[ "${DEPLOY-0}" -eq "1" ]] || [[ "${DEPLOY_ALT-0}" -eq "1" ]]; then
+if { [[ "${DEPLOY-0}" -eq "1" ]] || [[ "${DEPLOY_ALT-0}" -eq "1" ]]; } &&
+    [[ "${SKIP_DIST_UPLOAD-0}" -ne "1" ]]; then
     dist_dir="${build_dir}/dist"
     rm -rf "${dist_dir}/doc"
     mv "${dist_dir}"/* "${upload_dir}"
