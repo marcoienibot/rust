@@ -48,7 +48,8 @@ jobs:
     name: Calculate job matrix
     runs-on: ubuntu-24.04-arm
     outputs:
-      jobs: ${{ steps.jobs.outputs.jobs }}
+      jobs: ${{ steps.split.outputs.jobs }}
+      msvc_job: ${{ steps.split.outputs.msvc_job }}
       run_type: ${{ steps.jobs.outputs.run_type }}
     steps:
       - name: Checkout the source code
@@ -67,9 +68,17 @@ jobs:
           cd src/ci/citool
           CARGO_INCREMENTAL=0 cargo run --locked calculate-job-matrix >> $GITHUB_OUTPUT
         id: jobs
+      - name: Split out the Windows optimized distribution
+        id: split
+        env:
+          JOBS: ${{ steps.jobs.outputs.jobs }}
+        run: |
+          echo "jobs=$(jq -c '[.[] | select(.name != "dist-x86_64-msvc")]' <<< "$JOBS")" >> "$GITHUB_OUTPUT"
+          echo "msvc_job=$(jq -c 'map(select(.name == "dist-x86_64-msvc")) | first' <<< "$JOBS")" >> "$GITHUB_OUTPUT"
   job:
     name: ${{ matrix.full_name }}
     needs: [ calculate_matrix ]
+    if: needs.calculate_matrix.outputs.jobs != '[]'
     runs-on: "${{ matrix.os }}"
     timeout-minutes: 360
     # The bors environment contains secrets required for elevated workflows (try and auto builds),
@@ -306,12 +315,43 @@ jobs:
           DD_GITHUB_JOB_NAME: ${{ matrix.full_name }}
         run: ./build/citool/debug/citool upload-build-metrics build/cpu-usage.csv
 
+  msvc_profiles:
+    name: ${{ fromJSON(needs.calculate_matrix.outputs.msvc_job).full_name }} - ${{ matrix.phase }}
+    needs: [ calculate_matrix ]
+    if: needs.calculate_matrix.outputs.msvc_job != 'null'
+    strategy:
+      fail-fast: ${{ needs.calculate_matrix.outputs.run_type != 'try' }}
+      matrix:
+        phase: [ rustc-pgo, llvm-pgo ]
+    uses: ./.github/workflows/dist-x86_64-msvc.yml
+    with:
+      job: ${{ needs.calculate_matrix.outputs.msvc_job }}
+      run_type: ${{ needs.calculate_matrix.outputs.run_type }}
+      phase: ${{ matrix.phase }}
+    secrets: inherit
+
+  msvc_dist:
+    name: ${{ fromJSON(needs.calculate_matrix.outputs.msvc_job).full_name }}
+    needs: [ calculate_matrix, msvc_profiles ]
+    if: needs.calculate_matrix.outputs.msvc_job != 'null'
+    uses: ./.github/workflows/dist-x86_64-msvc.yml
+    with:
+      job: ${{ needs.calculate_matrix.outputs.msvc_job }}
+      run_type: ${{ needs.calculate_matrix.outputs.run_type }}
+      phase: dist
+    secrets: inherit
+
   # This job is used to publish toolstate for successful auto builds.
   outcome:
     name: publish toolstate
     runs-on: ubuntu-24.04
-    needs: [ calculate_matrix, job ]
-    if: ${{ needs.calculate_matrix.outputs.run_type == 'auto' }}
+    needs: [ calculate_matrix, job, msvc_profiles, msvc_dist ]
+    if: >-
+      ${{ !cancelled() && needs.calculate_matrix.outputs.run_type == 'auto'
+          && needs.job.result == 'success'
+          && (needs.msvc_dist.result == 'success'
+              || (needs.calculate_matrix.outputs.msvc_job == 'null'
+                  && needs.msvc_dist.result == 'skipped')) }}
     environment: ${{ (github.repository == 'rust-lang/rust' && 'bors') || '' }}
     steps:
       - name: checkout the source code

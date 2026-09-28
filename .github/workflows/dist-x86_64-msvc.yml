@@ -1,0 +1,163 @@
+name: Windows optimized distribution
+
+on:
+  workflow_call:
+    inputs:
+      job:
+        required: true
+        type: string
+      run_type:
+        required: true
+        type: string
+      phase:
+        required: true
+        type: string
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ inputs.phase }}
+    runs-on: ${{ fromJSON(inputs.job).os }}
+    timeout-minutes: 360
+    environment: ${{ ((github.repository == 'rust-lang/rust' && (github.ref == 'refs/heads/automation/bors/try' || github.ref == 'refs/heads/automation/bors/try-perf' || github.ref == 'refs/heads/automation/bors/auto')) && 'bors') || '' }}
+    env:
+      CI_JOB_NAME: ${{ inputs.phase == 'dist' && fromJSON(inputs.job).name || format('{0}-{1}', fromJSON(inputs.job).name, inputs.phase) }}
+      CI_JOB_DOC_URL: ${{ fromJSON(inputs.job).doc_url }}
+      GITHUB_WORKFLOW_RUN_ID: ${{ github.run_id }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+      SCCACHE_BUCKET: rust-lang-ci-sccache2
+      SCCACHE_REGION: us-west-1
+      CACHE_DOMAIN: ci-caches.rust-lang.org
+      TOOLSTATE_REPO: https://github.com/rust-lang-nursery/rust-toolstate
+      TOOLSTATE_REPO_ACCESS_TOKEN: ${{ secrets.TOOLSTATE_REPO_ACCESS_TOKEN }}
+      OPT_DIST_PHASE: ${{ inputs.phase }}
+    steps:
+      - name: disable git crlf conversion
+        run: git config --global core.autocrlf false
+
+      - name: checkout the source code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: add extra environment variables
+        run: src/ci/scripts/setup-environment.sh
+        env:
+          EXTRA_VARIABLES: ${{ toJSON(fromJSON(inputs.job).env) }}
+
+      - name: ensure the channel matches the target branch
+        run: src/ci/scripts/verify-channel.sh
+
+      - name: collect CPU statistics
+        run: src/ci/scripts/collect-cpu-stats.sh
+
+      - name: show the current environment
+        run: src/ci/scripts/dump-environment.sh
+
+      - name: install awscli
+        run: src/ci/scripts/install-awscli.sh
+
+      - name: install sccache
+        run: src/ci/scripts/install-sccache.sh
+
+      - name: install clang
+        run: src/ci/scripts/install-clang.sh
+
+      - name: install tidy
+        run: src/ci/scripts/install-tidy.sh
+
+      - name: install WIX
+        run: src/ci/scripts/install-wix.sh
+        if: inputs.phase == 'dist'
+
+      - name: disable git crlf conversion
+        run: src/ci/scripts/disable-git-crlf-conversion.sh
+
+      - name: checkout submodules
+        run: src/ci/scripts/checkout-submodules.sh
+
+      - name: install ninja
+        run: src/ci/scripts/install-ninja.sh
+
+      - name: disable git crlf conversion
+        run: src/ci/scripts/disable-git-crlf-conversion.sh
+
+      - name: ensure line endings are correct
+        run: src/ci/scripts/verify-line-endings.sh
+
+      - name: ensure backported commits are in upstream branches
+        run: src/ci/scripts/verify-backported-commits.sh
+
+      - name: ensure the stable version number is correct
+        run: src/ci/scripts/verify-stable-version-number.sh
+
+      - name: show the current environment
+        run: src/ci/scripts/dump-environment.sh
+
+      - name: build citool
+        run: |
+          cd src/ci/citool
+          CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=../../../build/citool cargo build --locked
+
+      - name: download rustc PGO profiles
+        if: inputs.phase == 'dist'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-x86_64-msvc-rustc-pgo
+          path: opt-artifacts
+
+      - name: download LLVM PGO profiles
+        if: inputs.phase == 'dist'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-x86_64-msvc-llvm-pgo
+          path: opt-artifacts
+
+      - name: run the build
+        run: src/ci/scripts/run-build-from-ci.sh 2>&1
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CACHES_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CACHES_AWS_SECRET_ACCESS_KEY }}
+
+      - name: upload PGO profiles
+        if: inputs.phase != 'dist'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-x86_64-msvc-${{ inputs.phase }}
+          path: opt-artifacts/*-pgo.profdata
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+      - name: print disk usage
+        if: always()
+        run: df -h
+
+      - name: upload artifacts to S3
+        if: inputs.phase == 'dist'
+        run: src/ci/scripts/upload-artifacts.sh
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY }}
+
+      - name: postprocess metrics into the summary
+        continue-on-error: true
+        run: |
+          PARENT_COMMIT=$(git rev-list --author='bors@rust-lang.org' --author='122020455+rust-bors\[bot\]@users.noreply.github.com' -n1 --first-parent HEAD^1)
+          ./build/citool/debug/citool postprocess-metrics \
+              --job-name "$CI_JOB_NAME" \
+              --parent "$PARENT_COMMIT" \
+              build/metrics.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload job metrics to DataDog
+        continue-on-error: true
+        if: inputs.run_type != 'pr'
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+          DD_GITHUB_JOB_NAME: ${{ inputs.phase == 'dist' && fromJSON(inputs.job).full_name || format('{0}-{1}', fromJSON(inputs.job).full_name, inputs.phase) }}
+        run: ./build/citool/debug/citool upload-build-metrics build/cpu-usage.csv
